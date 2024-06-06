@@ -9,12 +9,14 @@ import time
 import logging
 import sys
 import piexif
+import exiftool
 
 from PIL import Image
 
 ## config
 IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png']
-VIDEO_EXTENSIONS = ['.mts', '.mpg', '.mov', '.mp4']
+VIDEO_EXTENSIONS = ['.mts', '.mpg', '.mov', '.mp4', '.3gp']
+RAW_EXTENSIONS = ['.nef', '.raw', '.lrf']
 
 # create logger
 log = logging.getLogger("rename_photos")
@@ -64,7 +66,7 @@ def is_raw(file_ext):
     :type file_ext: str
     :return: True if the given file extension is a raw image file, false if not.
     """
-    if file_ext.lower() in ['.nef', '.raw']:
+    if file_ext.lower() in RAW_EXTENSIONS:
         return True
     else:
         return False
@@ -78,6 +80,8 @@ def get_file_extension(file_ext):
         return ".png"
     elif file_ext_lower == ".nef":
         return ".nef"
+    elif file_ext_lower == ".lrf":
+        return ".lrf"
     elif file_ext_lower in VIDEO_EXTENSIONS:
         return file_ext_lower
     else:
@@ -95,6 +99,7 @@ def parse_arguments():
                         help="output potential changes without performing them")
     parser.add_argument("-l", "--log", type=str, help="define log file location and enable file logging")
     parser.add_argument("-y", "--year", type=int, help="define the default year for all files")
+    parser.add_argument("-e", "--exclude", nargs='+', help="define folder names to be excluded")
 
     # parse arguments from input
     args = parser.parse_args()
@@ -104,10 +109,19 @@ def parse_arguments():
     return args
 
 
-def init_logging(log_file=None):
-    if log_file is None:
-        log.debug("No log file provided, logging to file disabled.")
+def init_logging(log_file=None, start_dir=None, enabled=True):
+    if not enabled:
         return
+
+    if log_file is None:
+        log_file = os.path.join(start_dir, "rename_photos.log")
+        log.info(f"No log file provided, saving log to root dir: {start_dir}")
+
+    if os.path.isfile(log_file):
+        file_id = 1
+        while os.path.isfile(f"{log_file}.{file_id}"):
+            file_id += 1
+        os.rename(log_file, f"{log_file}.{file_id}")
 
     fh = logging.FileHandler(log_file, mode='w', encoding='utf-8')
     fh.setLevel(logging.INFO)
@@ -133,9 +147,18 @@ def get_file_datetime(file_path, file_ext):
         # extracting the exif metadata
         # exifdata = image.getexif()
 
-        exif_dict = piexif.load(image.info['exif'])
-        if piexif.ExifIFD.DateTimeOriginal in exif_dict['Exif'].keys():
-            date_time = exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal].decode("utf-8")
+        try:
+            exif_dict = piexif.load(image.info['exif'])
+            if piexif.ExifIFD.DateTimeOriginal in exif_dict['Exif'].keys():
+                date_time = exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal].decode("utf-8")
+        except KeyError:
+            pass
+
+    elif is_vid(file_ext):
+        with exiftool.ExifToolHelper() as et:
+            metadata = et.get_metadata(file_path)
+            for d in metadata:
+                date_time = d["QuickTime:CreateDate"]
 
         # # looping through all the tags present in exifdata
         # for tagid in exifdata:
@@ -151,6 +174,11 @@ def get_file_datetime(file_path, file_ext):
         time_stamp = min(os.path.getctime(file_path), os.path.getmtime(file_path))
         date_time = time.strftime("%Y:%m:%d %H:%M:%S", time.gmtime(time_stamp))
 
+    try:
+        datetime.strptime(date_time, "%Y:%m:%d %H:%M:%S").timestamp()
+    except ValueError:
+        date_time = datetime.fromtimestamp(0).strftime("%Y:%m:%d %H:%M:%S")
+
     return date_time
 
 
@@ -159,20 +187,34 @@ def set_file_datetime(file_path, file_ext, new_date_time):
     Set the modification time of a given filename to the given mtime.
     mtime must be a datetime object.
     """
+    set_date_time = False
     if is_img(file_ext):
         # open the image
         image = Image.open(file_path)
 
 
         # extracting the exif metadata
-        exif_dict = piexif.load(image.info['exif'])
-        if piexif.ExifIFD.DateTimeOriginal in exif_dict['Exif'].keys():
-            exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = new_date_time.strftime("%Y:%m:%d %H:%M:%S")
+        try:
+            exif_dict = piexif.load(image.info['exif'])
+            new_date_time = new_date_time.strftime("%Y:%m:%d %H:%M:%S")
+            if piexif.ExifIFD.DateTimeOriginal in exif_dict['Exif'].keys():
+                exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = new_date_time
+            if piexif.ExifIFD.DateTimeOriginal in exif_dict['Exif'].keys():
+                exif_dict['Exif'][piexif.ExifIFD.DateTimeDigitized] = new_date_time
+            if '0th' in exif_dict.keys() and piexif.ImageIFD.DateTime in exif_dict['0th'].keys():
+                exif_dict['0th'][piexif.ImageIFD.DateTime] = new_date_time
+            if '1st' in exif_dict.keys() and piexif.ImageIFD.DateTime in exif_dict['1st'].keys():
+                exif_dict['1st'][piexif.ImageIFD.DateTime] = new_date_time
+
             exif_bytes = piexif.dump(exif_dict)
             image.save(file_path, image.format, exif=exif_bytes)
+            set_date_time = True
 
-        log.info(f"Set new exif-time ({new_date_time}) for file: {file_path}")
-    else:
+            log.info(f"Set new exif-time ({new_date_time}) for file: {file_path}")
+        except KeyError:
+            pass
+
+    if not set_date_time:
         stat = os.stat(file_path)
         atime = stat.st_atime
         os.utime(file_path, times=(atime, new_date_time.timestamp()))
@@ -214,8 +256,10 @@ def rename_file(file_path, file_ext, dry_run, default_year=None, file_mon_day=No
             file_mon_day = input("Please enter new date for given file (form: mmdd):  ")
             if file_mon_day is None or len(file_mon_day) < 4:
                 log.info(f"No date entered, using day/month of original date ({dat[4:]})")
-                file_mon_day = dat[4:]
-            file_mon_day_changed = True
+                # file_mon_day = dat[4:]
+                file_mon_day_changed = False
+            else:
+                file_mon_day_changed = True
 
     if file_mon_day is not None and len(file_mon_day) == 4:
         dat = f'{default_year}{file_mon_day}'
@@ -260,11 +304,16 @@ def rename_file(file_path, file_ext, dry_run, default_year=None, file_mon_day=No
     file_path_new = os.path.join(os.path.dirname(file_path), file_name_new)
 
     # rename the file
-    if not dry_run:
-        os.rename(file_path, file_path_new)
+    if file_path == file_path_new:
+        log.info(f"Skipped file: '{file_path}' > '{file_name_new}'")
+    else:
+        if not dry_run:
+            os.rename(file_path, file_path_new)
 
-    # print message and write to logs
-    log.info(f"Renamed file: '{file_path}' > '{file_name_new}'")
+            # print message and write to logs
+            log.info(f"Renamed file: '{file_path}' > '{file_name_new}'")
+        else:
+            log.info(f"File to rename: '{file_path}' > '{file_name_new}'")
 
     return file_path_new, file_mon_day, file_date_offset
 
@@ -279,18 +328,27 @@ def sort_files_by_date(directory, files):
         date_time_i = get_file_datetime(file_path_i, file_ext_i)
         date_time_i = datetime.strptime(date_time_i, "%Y:%m:%d %H:%M:%S").timestamp()
 
+        while date_time_i in sorted_files.keys():
+            date_time_i += 1
         sorted_files[date_time_i] = file_i
 
     return dict(sorted(sorted_files.items()))
 
 
-def rename_dirs(start_dir, recursive=False, dry_run=False, default_year=None):
+def rename_dirs(start_dir, recursive=False, dry_run=False, default_year=None, excluded_dirs=None):
     # loop through all directories
     for root, dirs, files in os.walk(start_dir, topdown=True):
         files_raw = list()
         files_renamed = dict()
         file_mon_day = None
         file_date_offset = None
+
+        if excluded_dirs is not None and os.path.basename(root) in excluded_dirs:
+            log.info(f"Skipping excluded directory '{root}'")
+            if not recursive:
+                break
+            else:
+                continue
 
         log.info(f"Renaming images in '{root}'")
 
@@ -346,9 +404,11 @@ def rename_dirs(start_dir, recursive=False, dry_run=False, default_year=None):
 def main():
     args = parse_arguments()
 
-    init_logging(log_file=args.log)
+    # if not args.dry_run:
+    init_logging(log_file=args.log, start_dir=args.dir, enabled=not args.dry_run)
 
-    rename_dirs(start_dir=args.dir, recursive=args.recursive, dry_run=args.dry_run, default_year=args.year)
+    rename_dirs(start_dir=args.dir, recursive=args.recursive, dry_run=args.dry_run, default_year=args.year,
+                excluded_dirs=args.exclude)
 
 
 if __name__ == '__main__':
